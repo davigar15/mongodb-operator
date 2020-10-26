@@ -1,4 +1,3 @@
-import socket
 import json
 import logging
 
@@ -13,7 +12,7 @@ App data:
 
 {
     "ready": "True" or "False"
-    "replica_set_hosts": "[mongodb1, mongodb2, mongodb3, ...]" 
+    "replica_set_hosts": "[mongodb1, mongodb2, mongodb3, ...]"
 }
 
 ready: Indicates whether the cluster is ready or not,
@@ -105,19 +104,6 @@ class MongoDBCluster(Object):
             self.state.started = bool(ready)
         return self.state.ready
 
-    @property
-    def replica_set_uri(self):
-        uri = "mongodb://"
-        for i, host in enumerate(self.hosts):
-            if i:
-                uri += ","
-            uri += f"{host}:{self.port}"
-        uri += "/"
-        return uri
-
-    @property
-    def standalone_uri(self):
-        return f"mongodb://{self.model.app.name}:{self.port}/"
 
     def need_replica_set_reconfiguration(self):
         return self.hosts != self.replica_set_hosts

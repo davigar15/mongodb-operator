@@ -6,3 +6,9 @@ lib/
 lib64
 pyvenv.cfg
 share/
+cover
+.tox
+.stestr
+include
+.coverage
+__pycache__

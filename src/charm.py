@@ -2,8 +2,6 @@
 
 import logging
 
-from urllib.parse import urlparse
-
 from ops.charm import CharmBase, CharmEvents
 
 from ops.framework import StoredState, EventBase, EventSource
@@ -16,9 +14,10 @@ from ops.model import (
 )
 from oci_image import OCIImageResource, OCIImageResourceError
 
-from pod_spec import PodSpecBuilder
+from pod_spec import make_pod_spec
 from cluster import MongoDBCluster
-from mongo import Mongo
+from mongo import MongoConnector
+
 
 logger = logging.getLogger(__name__)
 
@@ -87,9 +86,9 @@ class MongoDBCharm(CharmBase):
 
         logger.debug("MongoDBCharm initialized!")
 
-    ##############################################
-    ########### CHARM HOOKS HANDLERS #############
-    ##############################################
+    # #############################################
+    # ########## CHARM HOOKS HANDLERS #############
+    # #############################################
 
     # hooks: install, config-changed, upgrade-charm
     def configure_pod(self, event):
@@ -115,13 +114,11 @@ class MongoDBCharm(CharmBase):
 
         # Build Pod spec
         self.unit.status = BlockedStatus("Assembling pod spec")
-        builder = PodSpecBuilder(
-            name=self.model.app.name,
-            replica_set_name=self.replica_set_name,
-            port=self.port,
-            image_info=image_info,
+        pod_spec = make_pod_spec(
+            image_info,
+            self.port,
+            replica_set_name=self.replica_set_name if not self.standalone else None,
         )
-        pod_spec = builder.make_pod_spec()
 
         # Update pod spec if the generated one is different
         # from the one previously applied
@@ -137,13 +134,16 @@ class MongoDBCharm(CharmBase):
         if not self.unit.is_leader():
             return
         logger.debug("Running on_start")
-        if self._is_mongodb_service_ready():
+        if MongoConnector.ready(self.standalone_uri):
             self.on.mongodb_started.emit()
         else:
             # This event is not being retriggered before update_status
             event.defer()
+            return
 
-        self.on_update_status(event)
+        # Can't call update_status because an infinite loop might happen
+        # due to the fact I'm calling on_start from update_status
+        # self.on_update_status(event)
         logger.debug("Running on_start finished")
 
     # hooks: update-status
@@ -151,7 +151,7 @@ class MongoDBCharm(CharmBase):
         status_message = ""
         if self.standalone:
             status_message += "standalone-mode: "
-            if self._is_mongodb_service_ready():
+            if MongoConnector.ready(self.standalone_uri):
                 status_message += "ready"
                 self.unit.status = ActiveStatus(status_message)
             else:
@@ -159,24 +159,27 @@ class MongoDBCharm(CharmBase):
                 self.unit.status = WaitingStatus(status_message)
         else:
             status_message += f"replica-set-mode({self.replica_set_name}): "
-            if self._is_mongodb_service_ready():
+            if MongoConnector.ready(self.standalone_uri):
                 status_message += "ready"
                 if self.unit.is_leader():
                     if self.cluster.ready:
                         hosts_count = len(self.cluster.replica_set_hosts)
                         status_message += f" ({hosts_count} members)"
                     else:
-                        status_message += " (replica set not ready yet)"
-                        # Since on_start is not being properly triggered, I'm calling it manually here
-                        self.on_start(event)
+                        status_message += " (replica set not initialized yet)"
+                        # Since on_start is not being properly triggered,
+                        # I'm calling it manually here.
+                        self.on.start.emit()
+                        self.unit.status = WaitingStatus(status_message)
+                        return
                 self.unit.status = ActiveStatus(status_message)
             else:
                 status_message += "service not ready yet"
                 self.unit.status = WaitingStatus(status_message)
 
-    ##############################################
-    ######## PEER RELATION HOOK HANDLERS #########
-    ##############################################
+    # #############################################
+    # ####### PEER RELATION HOOK HANDLERS #########
+    # #############################################
 
     # hooks: cluster-relation-changed, cluster-relation-departed
     def reconfigure(self, event):
@@ -187,39 +190,41 @@ class MongoDBCharm(CharmBase):
             and self.cluster.replica_set_initialized
             and self.cluster.need_replica_set_reconfiguration()
         ):
-            self.mongo.reconfigure_replica_set(self.cluster.hosts)
+            uri = self.replica_set_uri
+            config = MongoConnector.replset_get_config(uri)
+            config = MongoConnector.replset_generate_config(
+                self.cluster.hosts,
+                self.replica_set_name,
+                increase_version=True,
+                config=config,
+            )
+            MongoConnector.replset_reconfigure(uri, config)
             self.on.replica_set_configured.emit(self.cluster.hosts)
         self.on_update_status(event)
         logger.debug("Running reconfigure finished")
 
-    ##############################################
-    ########## CLUSTER EVENT HANDLERS ############
-    ##############################################
+    # #############################################
+    # ######### CLUSTER EVENT HANDLERS ############
+    # #############################################
 
     def on_mongodb_started(self, event):
         if not self.unit.is_leader() or self.standalone:
-            self.on_update_status(event)
             return
         logger.debug("Running on_mongodb_started")
         if not self.cluster.replica_set_initialized:
             self.unit.status = WaitingStatus("Initializing the replica set")
-            self.mongo.initialize_replica_set(self.cluster.hosts)
+            config = MongoConnector.replset_generate_config(
+                self.cluster.hosts, self.replica_set_name
+            )
+            MongoConnector.replset_initialize(self.standalone_uri, config)
             self.on.replica_set_configured.emit(self.cluster.hosts)
 
         self.on.cluster_ready.emit()
-        self.on_update_status(event)
         logger.debug("Running on_mongodb_started finished")
 
-    ##############################################
-    ############### PROPERTIES ###################
-    ##############################################
-
-    @property
-    def mongo(self):
-        return Mongo(
-            standalone_uri=self.cluster.standalone_uri,
-            replica_set_uri=f"{self.cluster.replica_set_uri}?replicaSet={self.replica_set_name}",
-        )
+    # #############################################
+    # ############## PROPERTIES ###################
+    # #############################################
 
     @property
     def replica_set_name(self):
@@ -229,9 +234,9 @@ class MongoDBCharm(CharmBase):
     def standalone(self):
         return self.model.config["standalone"]
 
-    ##############################################
-    ############## PRIVATE METHODS ###############
-    ##############################################
+    # #############################################
+    # ############# PRIVATE METHODS ###############
+    # #############################################
 
     def _check_settings(self):
         problems = []
@@ -249,8 +254,19 @@ class MongoDBCharm(CharmBase):
 
         return ";".join(problems)
 
-    def _is_mongodb_service_ready(self):
-        return self.mongo.is_ready()
+    @property
+    def replica_set_uri(self):
+        uri = "mongodb://"
+        for i, host in enumerate(self.cluster.hosts):
+            if i:
+                uri += ","
+            uri += f"{host}:{self.port}"
+        uri += f"/?replicaSet={self.replica_set_name}"
+        return uri
+
+    @property
+    def standalone_uri(self):
+        return f"mongodb://{self.model.app.name}:{self.port}/"
 
 
 if __name__ == "__main__":

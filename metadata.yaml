@@ -1,9 +1,9 @@
 name: mongodb
 summary: A MongoDB K8s charm
 description: |
-    MongoDB charm for Kubernetes
+  MongoDB charm for Kubernetes
 series:
-   - kubernetes
+  - kubernetes
 tags:
   - kubernetes
   - mongodb
@@ -23,4 +23,4 @@ resources:
   mongodb-image:
     type: oci-image
     description: upstream docker image for mongodb
-    upstream-source: 'mongo:4.4.1'
+    upstream-source: "mongo:4.4.1"
